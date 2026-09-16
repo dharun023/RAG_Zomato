@@ -18,7 +18,7 @@ load_dotenv()
 #     "OLLAMA_HOST",
 #     "https://ollama.com",
 # )
-OLLAMA_HOST = "https://ollama.com"
+OLLAMA_HOST = "https://api.ollama.com/v1/models"
 
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
@@ -54,6 +54,8 @@ st.write({
     "api_key_configured": bool(os.getenv("OLLAMA_API_KEY")),
     "embedding_model": os.getenv("EMBEDDING_MODEL"),
 })
+st.write("API Key present:", bool(OLLAMA_API_KEY))
+st.write("OLLAMA_HOST:", OLLAMA_HOST)
 
 def read_reviews_from_snowflake():
     def get_connection():
