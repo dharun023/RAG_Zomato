@@ -7,6 +7,14 @@ import snowflake.connector
 import streamlit as st
 from dotenv import load_dotenv
 
+from sentence_transformers import SentenceTransformer
+
+
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+embedding_model = SentenceTransformer(
+    EMBEDDING_MODEL
+)
 
 load_dotenv()
 
@@ -30,6 +38,7 @@ OLLAMA_HOST = os.getenv(
 OLLAMA_API_KEY = required_env("OLLAMA_API_KEY")
 
 CHAT_MODEL = required_env("OLLAMA_MODEL")
+# EMBEDDING_MODEL = required_env("EMBEDDING_MODEL")
 EMBEDDING_MODEL = required_env("EMBEDDING_MODEL")
 
 client = ollama.Client(
@@ -101,13 +110,13 @@ def embed(texts):
     if not texts:
         return []
 
-    response = client.embed(
-        model=EMBEDDING_MODEL,
-        input=texts,
+    vectors = embedding_model.encode(
+        texts,
+        normalize_embeddings=False,
+        convert_to_numpy=True,
     )
 
-    return response["embeddings"]
-
+    return vectors.tolist()
 
 @st.cache_data(ttl=3600)
 def create_review_embeddings(review_texts):
@@ -163,46 +172,37 @@ def find_similar_reviews(question, df):
 
 
 def ask_llm(question, top_reviews):
-    context_lines = []
-
-    for _, row in top_reviews.iterrows():
-        context_lines.append(
-            f"({row['city']}, {row['rating']} stars) "
-            f"{row['comment']}"
-        )
-
-    context = "\n".join(context_lines)
-
-    system_prompt = (
-        "Answer only using the customer reviews provided. "
-        "Be concise. If the reviews do not cover the question, "
-        "say that the reviews do not provide enough information."
+    context = "\n".join(
+        f"({row['city']}, {row['rating']} stars) "
+        f"{row['comment']}"
+        for _, row in top_reviews.iterrows()
     )
-
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Question: {question}\n\n"
-                f"Reviews:\n{context}"
-            ),
-        },
-    ]
 
     response = client.chat(
         model=CHAT_MODEL,
-        messages=messages,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Answer only using the customer reviews provided. "
+                    "Be concise. If the reviews do not cover the question, "
+                    "say that the reviews do not provide enough information."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {question}\n\n"
+                    f"Reviews:\n{context}"
+                ),
+            },
+        ],
         options={
             "temperature": 0,
         },
     )
 
     return response.message.content
-
 
 st.title("Chat with your Zomato Reviews")
 
