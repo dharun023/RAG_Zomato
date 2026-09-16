@@ -12,16 +12,28 @@ load_dotenv()
 
 # client = ollama.Client(host="http://127.0.0.1:11434")
 
+
+
 OLLAMA_HOST = os.getenv(
     "OLLAMA_HOST",
     "https://ollama.com",
 )
 
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+
+if not OLLAMA_API_KEY:
+    raise RuntimeError("OLLAMA_API_KEY is missing")
+
 client = ollama.Client(
     host=OLLAMA_HOST,
     headers={
-        "Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"
+        "Authorization": f"Bearer {OLLAMA_API_KEY}"
     },
+)
+
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "embeddinggemma",
 )
 
 MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
@@ -59,9 +71,15 @@ def read_reviews_from_snowflake():
     return df
 
 
-def embed(texts: list[str]):
-    # Ollama's batched embed API
-    result = ollama.embed(model=EMBEDDING_MODEL, input=texts)
+def embed(texts):
+    if isinstance(texts, str):
+        texts = [texts]
+
+    result = client.embed(
+        model=EMBEDDING_MODEL,
+        input=texts,
+    )
+
     return result["embeddings"]
 
 
