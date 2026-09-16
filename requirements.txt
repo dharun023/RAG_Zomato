@@ -3,7 +3,8 @@ ollama
 snowflake-connector-python
 python-dotenv
 pandas
-
+sentence-transformers
 plotly
 sqlparse
 ollama>=0.6.0
+sentence-transformers
