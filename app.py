@@ -41,12 +41,17 @@ MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 
 
-EMBEDDING_MODEL = "nomic-embed-text"   # or "llama3.2" if you prefer
+# EMBEDDING_MODEL = "nomic-embed-text"   # or "llama3.2" if you prefer
 CHAT_MODEL = "llama3.2"                # e.g. "llama3.1", "llama3.2", etc.
 NEW_REVIEWS = 500
 TOK_K = 5
 CACHE_FILE = "review_embeddings.parquet"
 
+st.write({
+    "ollama_host": os.getenv("OLLAMA_HOST"),
+    "api_key_configured": bool(os.getenv("OLLAMA_API_KEY")),
+    "embedding_model": os.getenv("EMBEDDING_MODEL"),
+})
 
 def read_reviews_from_snowflake():
     def get_connection():
