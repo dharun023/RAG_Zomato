@@ -14,12 +14,10 @@ load_dotenv()
 
 
 
-# OLLAMA_HOST = os.getenv(
-#     "OLLAMA_HOST",
-#     "https://ollama.com",
-# )
-OLLAMA_HOST = "https://api.ollama.com/v1/models"
-
+OLLAMA_HOST = os.getenv(
+    "OLLAMA_HOST",
+    "https://ollama.com",
+)
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
@@ -54,8 +52,6 @@ st.write({
     "api_key_configured": bool(os.getenv("OLLAMA_API_KEY")),
     "embedding_model": os.getenv("EMBEDDING_MODEL"),
 })
-st.write("API Key present:", bool(OLLAMA_API_KEY))
-st.write("OLLAMA_HOST:", OLLAMA_HOST)
 
 def read_reviews_from_snowflake():
     def get_connection():
@@ -68,6 +64,7 @@ def read_reviews_from_snowflake():
             schema=os.environ["SNOWFLAKE_SCHEMA"],
             )
 
+    conn = get_connection()
     query = f"""
         SELECT REVIEW_ID, CITY, RATING, COMMENT
         FROM ZOMATO.STAGING.STG_REVIEWS
@@ -138,7 +135,7 @@ def ask_llm(question, top_reviews):
         {"role": "user", "content": f"Question: {question}\n\nReviews:\n{context}"}
     ]
 
-    response = ollama.chat(model=CHAT_MODEL, messages=messages)
+    response = client.chat(model=CHAT_MODEL, messages=messages)
     return response["message"]["content"]
 
 
