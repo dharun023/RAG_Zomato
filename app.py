@@ -14,10 +14,12 @@ load_dotenv()
 
 
 
-OLLAMA_HOST = os.getenv(
-    "OLLAMA_HOST",
-    "https://ollama.com",
-)
+# OLLAMA_HOST = os.getenv(
+#     "OLLAMA_HOST",
+#     "https://ollama.com",
+# )
+OLLAMA_HOST = "https://ollama.com"
+
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
