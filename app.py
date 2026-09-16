@@ -35,7 +35,7 @@ EMBEDDING_MODEL = required_env("EMBEDDING_MODEL")
 client = ollama.Client(
     host=OLLAMA_HOST,
     headers={
-        "Authorization": f"Bearer {OLLAMA_API_KEY}",
+        "Authorization": "OLLAMA_API_KEY",
     },
 )
 
