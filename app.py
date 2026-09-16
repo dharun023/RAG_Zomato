@@ -1,78 +1,90 @@
 import os
+
 import numpy as np
-import pandas as pd
-import streamlit as st
-import snowflake.connector
 import ollama
+import pandas as pd
+import snowflake.connector
+import streamlit as st
 from dotenv import load_dotenv
 
+
 load_dotenv()
-# os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
 
 
-# client = ollama.Client(host="http://127.0.0.1:11434")
+def required_env(name):
+    value = os.getenv(name)
 
+    if value is None or not value.strip():
+        raise RuntimeError(
+            f"Missing environment variable: {name}"
+        )
+
+    return value.strip()
 
 
 OLLAMA_HOST = os.getenv(
     "OLLAMA_HOST",
     "https://ollama.com",
-)
+).strip()
 
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+OLLAMA_API_KEY = required_env("OLLAMA_API_KEY")
 
-if not OLLAMA_API_KEY:
-    raise RuntimeError("OLLAMA_API_KEY is missing")
+CHAT_MODEL = required_env("OLLAMA_MODEL")
+EMBEDDING_MODEL = required_env("EMBEDDING_MODEL")
 
 client = ollama.Client(
     host=OLLAMA_HOST,
     headers={
-        "Authorization": f"Bearer {OLLAMA_API_KEY}"
+        "Authorization": f"Bearer {OLLAMA_API_KEY}",
     },
 )
 
-EMBEDDING_MODEL = os.getenv(
-    "EMBEDDING_MODEL",
-    "embeddinggemma",
+
+NEW_REVIEWS = 500
+TOP_K = 5
+
+
+st.set_page_config(
+    page_title="Zomato Review Analytics",
+    page_icon="🍽️",
+    layout="wide",
 )
 
-MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+
+def get_connection():
+    return snowflake.connector.connect(
+        user=required_env("SNOWFLAKE_USER"),
+        password=required_env("SNOWFLAKE_PASSWORD"),
+        account=required_env("SNOWFLAKE_ACCOUNT"),
+        warehouse=required_env("SNOWFLAKE_WAREHOUSE"),
+        database=required_env("SNOWFLAKE_DATABASE"),
+        schema=required_env("SNOWFLAKE_SCHEMA"),
+    )
 
 
-
-
-# EMBEDDING_MODEL = "nomic-embed-text"   # or "llama3.2" if you prefer
-CHAT_MODEL = "llama3.2"                # e.g. "llama3.1", "llama3.2", etc.
-NEW_REVIEWS = 500
-TOK_K = 5
-CACHE_FILE = "review_embeddings.parquet"
-
-st.write({
-    "ollama_host": os.getenv("OLLAMA_HOST"),
-    "api_key_configured": bool(os.getenv("OLLAMA_API_KEY")),
-    "embedding_model": os.getenv("EMBEDDING_MODEL"),
-})
-
+@st.cache_data(ttl=600)
 def read_reviews_from_snowflake():
-    def get_connection():
-        return snowflake.connector.connect(
-            user=os.environ["SNOWFLAKE_USER"],
-            password=os.environ["SNOWFLAKE_PASSWORD"],
-            account=os.environ["SNOWFLAKE_ACCOUNT"],
-            warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-            database=os.environ["SNOWFLAKE_DATABASE"],
-            schema=os.environ["SNOWFLAKE_SCHEMA"],
-            )
-
     query = f"""
         SELECT REVIEW_ID, CITY, RATING, COMMENT
         FROM ZOMATO.STAGING.STG_REVIEWS
         SAMPLE ({NEW_REVIEWS} ROWS)
     """
-    df = conn.cursor().execute(query).fetch_pandas_all()
-    conn.close()
 
-    df.columns = [col.lower() for col in df.columns]
+    connection = get_connection()
+
+    try:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(query)
+            df = cursor.fetch_pandas_all()
+        finally:
+            cursor.close()
+    finally:
+        connection.close()
+
+    df.columns = [column.lower() for column in df.columns]
+    df["comment"] = df["comment"].fillna("").astype(str)
+
     return df
 
 
@@ -80,77 +92,177 @@ def embed(texts):
     if isinstance(texts, str):
         texts = [texts]
 
-    result = client.embed(
+    texts = [
+        str(text).strip()
+        for text in texts
+        if str(text).strip()
+    ]
+
+    if not texts:
+        return []
+
+    response = client.embed(
         model=EMBEDDING_MODEL,
         input=texts,
     )
 
-    return result["embeddings"]
+    return response["embeddings"]
 
 
-@st.cache_data()
+@st.cache_data(ttl=3600)
+def create_review_embeddings(review_texts):
+    return embed(list(review_texts))
+
+
+@st.cache_data(ttl=600)
 def load_reviews():
-    if os.path.exists(CACHE_FILE):
-        return pd.read_parquet(CACHE_FILE)
-
     df = read_reviews_from_snowflake()
-    df["embedding"] = embed(df["comment"].tolist())
-    df.to_parquet(CACHE_FILE)
+
+    embeddings = create_review_embeddings(
+        tuple(df["comment"].tolist())
+    )
+
+    if len(embeddings) != len(df):
+        raise RuntimeError(
+            "The number of embeddings does not match "
+            "the number of reviews."
+        )
+
+    df = df.copy()
+    df["embedding"] = embeddings
+
     return df
 
 
-st.title("Chat with your Zomato Reviews")
-st.caption(f"Searching {NEW_REVIEWS} reviews, answering with {CHAT_MODEL} (local Llama via Ollama)")
-
-
 def cosine_similarity(vec_a, vec_b):
-    return np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
+    vec_a = np.asarray(vec_a, dtype=np.float32)
+    vec_b = np.asarray(vec_b, dtype=np.float32)
+
+    denominator = (
+        np.linalg.norm(vec_a) * np.linalg.norm(vec_b)
+    )
+
+    if denominator == 0:
+        return 0.0
+
+    return float(np.dot(vec_a, vec_b) / denominator)
 
 
 def find_similar_reviews(question, df):
     question_vector = embed([question])[0]
 
-    scores = []
-    for review_vector in df["embedding"]:
-        scores.append(cosine_similarity(question_vector, review_vector))
+    scores = [
+        cosine_similarity(question_vector, review_vector)
+        for review_vector in df["embedding"]
+    ]
 
-    df = df.copy()
-    df["score"] = scores
-    return df.nlargest(TOK_K, "score")
+    result = df.copy()
+    result["score"] = scores
+
+    return result.nlargest(TOP_K, "score")
 
 
 def ask_llm(question, top_reviews):
-    context = ""
+    context_lines = []
+
     for _, row in top_reviews.iterrows():
-        context += f" ({row['city']}, {row['rating']} stars) {row['comment']}\n"
+        context_lines.append(
+            f"({row['city']}, {row['rating']} stars) "
+            f"{row['comment']}"
+        )
+
+    context = "\n".join(context_lines)
 
     system_prompt = (
-        "Answer ONLY using the customer reviews provided. "
-        "Be concise. If the reviews don't cover it, say so."
+        "Answer only using the customer reviews provided. "
+        "Be concise. If the reviews do not cover the question, "
+        "say that the reviews do not provide enough information."
     )
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Question: {question}\n\nReviews:\n{context}"}
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n\n"
+                f"Reviews:\n{context}"
+            ),
+        },
     ]
 
-    response = ollama.chat(model=CHAT_MODEL, messages=messages)
-    return response["message"]["content"]
+    response = client.chat(
+        model=CHAT_MODEL,
+        messages=messages,
+        options={
+            "temperature": 0,
+        },
+    )
+
+    return response.message.content
 
 
-review_df = load_reviews()
+st.title("Chat with your Zomato Reviews")
+
+st.caption(
+    f"Searching {NEW_REVIEWS} reviews using "
+    f"{CHAT_MODEL} and {EMBEDDING_MODEL}"
+)
+
+with st.sidebar:
+    st.write("Configuration")
+    st.write({
+        "ollama_host": OLLAMA_HOST,
+        "chat_model": CHAT_MODEL,
+        "embedding_model": EMBEDDING_MODEL,
+        "api_key_configured": bool(OLLAMA_API_KEY),
+    })
+
+try:
+    review_df = load_reviews()
+
+except Exception as error:
+    st.error("Could not load or embed reviews.")
+    st.exception(error)
+    st.stop()
+
 
 question = st.text_input(
     "Ask a question about your reviews:",
-    placeholder="e.g. What are the most common complaints about delivery?"
+    placeholder=(
+        "e.g. What are the most common complaints "
+        "about delivery?"
+    ),
 )
 
-if question:
-    top_reviews = find_similar_reviews(question, review_df)
-    answer = ask_llm(question, top_reviews)
 
-    st.markdown("**Answer:**")
-    st.write(answer)
+if question.strip():
+    try:
+        top_reviews = find_similar_reviews(
+            question,
+            review_df,
+        )
 
-    with st.expander("Reviews used to build this answer"):
-        st.dataframe(top_reviews[["city", "rating", "comment"]], hide_index=True)
+        answer = ask_llm(
+            question,
+            top_reviews,
+        )
+
+        st.markdown("**Answer:**")
+        st.write(answer)
+
+        with st.expander(
+            "Reviews used to build this answer"
+        ):
+            st.dataframe(
+                top_reviews[
+                    ["city", "rating", "comment", "score"]
+                ],
+                hide_index=True,
+            )
+
+    except Exception as error:
+        st.error("Could not answer the question.")
+        st.exception(error)
