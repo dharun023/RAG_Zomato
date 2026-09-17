@@ -3,55 +3,33 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import snowflake.connector
-import ollama
+from groq import Groq
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
-# os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# client = ollama.Client(host="http://127.0.0.1:11434")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is missing. Please set it in your .env file or Render dashboard.")
 
+groq_client = Groq(api_key=GROQ_API_KEY)
 
+# Initialize the local embedding model
+@st.cache_resource()
+def get_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-OLLAMA_HOST = os.getenv(
-    "OLLAMA_HOST",
-    "https://ollama.com",
-)
+embedding_model = get_embedding_model()
 
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-
-if not OLLAMA_API_KEY:
-    raise RuntimeError("OLLAMA_API_KEY is missing")
-
-client = ollama.Client(
-    host=OLLAMA_HOST,
-    headers={
-        "Authorization": f"Bearer {OLLAMA_API_KEY}"
-    },
-)
-
-EMBEDDING_MODEL = os.getenv(
-    "EMBEDDING_MODEL",
-    "embeddinggemma",
-)
-
-MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-
-
-
-
-# EMBEDDING_MODEL = "nomic-embed-text"   # or "llama3.2" if you prefer
-CHAT_MODEL = "llama3.2"                # e.g. "llama3.1", "llama3.2", etc.
+# CHAT_MODEL = "llama-3.1-8b-instant"  # Fast, free Groq model (Llama 3.1 8B)
+CHAT_MODEL = "openai/gpt-oss-120b"
 NEW_REVIEWS = 500
 TOK_K = 5
 CACHE_FILE = "review_embeddings.parquet"
 
-st.write({
-    "ollama_host": os.getenv("OLLAMA_HOST"),
-    "api_key_configured": bool(os.getenv("OLLAMA_API_KEY")),
-    "embedding_model": os.getenv("EMBEDDING_MODEL"),
-})
+
 
 def read_reviews_from_snowflake():
     def get_connection():
@@ -62,7 +40,7 @@ def read_reviews_from_snowflake():
             warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
             database=os.environ["SNOWFLAKE_DATABASE"],
             schema=os.environ["SNOWFLAKE_SCHEMA"],
-            )
+        )
 
     conn = get_connection()
     query = f"""
@@ -76,18 +54,13 @@ def read_reviews_from_snowflake():
     df.columns = [col.lower() for col in df.columns]
     return df
 
-
 def embed(texts):
     if isinstance(texts, str):
         texts = [texts]
-
-    result = client.embed(
-        model=EMBEDDING_MODEL,
-        input=texts,
-    )
-
-    return result["embeddings"]
-
+    
+    # Generate embeddings locally using sentence-transformers
+    embeddings = embedding_model.encode(texts)
+    return embeddings.tolist()
 
 @st.cache_data()
 def load_reviews():
@@ -99,14 +72,11 @@ def load_reviews():
     df.to_parquet(CACHE_FILE)
     return df
 
-
 st.title("Chat with your Zomato Reviews")
-st.caption(f"Searching {NEW_REVIEWS} reviews, answering with {CHAT_MODEL} (local Llama via Ollama)")
-
+st.caption(f"Searching {NEW_REVIEWS} reviews, answering with {CHAT_MODEL} (via Groq)")
 
 def cosine_similarity(vec_a, vec_b):
     return np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
-
 
 def find_similar_reviews(question, df):
     question_vector = embed([question])[0]
@@ -118,7 +88,6 @@ def find_similar_reviews(question, df):
     df = df.copy()
     df["score"] = scores
     return df.nlargest(TOK_K, "score")
-
 
 def ask_llm(question, top_reviews):
     context = ""
@@ -135,9 +104,11 @@ def ask_llm(question, top_reviews):
         {"role": "user", "content": f"Question: {question}\n\nReviews:\n{context}"}
     ]
 
-    response = client.chat(model=CHAT_MODEL, messages=messages)
-    return response["message"]["content"]
-
+    response = groq_client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages
+    )
+    return response.choices[0].message.content
 
 review_df = load_reviews()
 
