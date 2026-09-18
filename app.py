@@ -1,156 +1,150 @@
 import os
-import time
-import numpy as np
+import json
 import pandas as pd
 import streamlit as st
 import snowflake.connector
 from groq import Groq
-from huggingface_hub import InferenceClient
-from huggingface_hub.errors import HfHubHTTPError
 from dotenv import load_dotenv
+
 
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY is missing. Please set it in your .env file or Render dashboard.")
-if not HF_TOKEN:
-    raise RuntimeError("HF_TOKEN is missing. Please set it in your .env file or Render dashboard.")
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+MODEL = "openai/gpt-oss-20b"  # Groq deprecated llama-3.1-8b-instant on 08/16/26; this is their recommended replacement
 
-# --- Hugging Face embeddings -------------------------------------------------
-# NOTE: the old "https://api-inference.huggingface.co/..." REST endpoint has been
-# fully retired by Hugging Face (it no longer even resolves in DNS). Embeddings
-# now go through the Inference Providers router, which this client handles for us
-# so we don't have to hardcode a URL that can change again.
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-hf_client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
+FORBIDDEN_WORDS = ['drop', 'delete', 'truncate', 'alter', 'update', 'insert', 'create', 'replace', 'grant', 'revoke']
 
-CHAT_MODEL = "openai/gpt-oss-20b"  # Groq deprecated llama-3.1-8b-instant on 08/16/26; this is their recommended replacement
-NEW_REVIEWS = 500
-TOK_K = 5
-CACHE_FILE = "review_embeddings.parquet"
+EXAMPLE_QUESTIONS = [
+    "Top 10 cities by GMV",
+    "Which cuisin has the most orders?",
+    "Average delivery time by city, worst first",
+    "Cancel rate by payment method"
+]
 
-def read_reviews_from_snowflake():
-    def get_connection():
-        return snowflake.connector.connect(
-            user=os.environ["SNOWFLAKE_USER"],
-            password=os.environ["SNOWFLAKE_PASSWORD"],
-            account=os.environ["SNOWFLAKE_ACCOUNT"],
-            warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-            database=os.environ["SNOWFLAKE_DATABASE"],
-            schema=os.environ["SNOWFLAKE_SCHEMA"],
-        )
+client = Groq(api_key=GROQ_API_KEY)
 
+SCHEMA = """
+Tables available (Snowflake). Use bare table names, no database or schema prefix.
+ 
+FCT_ORDERS(order_id, order_date, customer_id, restaurant_id, city, cuisine,
+           payment_method, order_status, is_delivered, sales_amount, discount,
+           delivery_fee, gst, customer_rating, delivery_time_min)
+DIM_RESTAURANT(restaurant_id, restaurant_name, city, cuisine, rating, cost_for_two)
+DIM_CUSTOMER(customer_id, customer_name, age, age_segment, gender, city)
+MART_DAILY_CITY_REVENUNE(order_date, city, orders, cancel_rate, gmv, aov)
+MART_RESTAURANT_PERFORMANCE(restaurant_id, restaurant_name, city, cuisine,
+                            orders, revenue, avg_customer_rating, cancel_rate)
+MART_DELIVERY_SLA(city, order_hour, delivered_orders, p50_delivery_min, late_rate)
+
+ 
+Note: gmv means delivered revenue. Prefer the MART_ tables when they fit the question.
+"""
+ 
+SYSTEM_PROMPT = f"""
+You are a Snowflake SQL expert. Write ONE SELECT query that answers the question.
+ 
+Rules:
+- SELECT queries only, never modify data.
+- Use bare table names (FCT_ORDERS, not ZOMATO.MARTS.FCT_ORDERS).
+- Add a LIMIT of 100 or less, unless the question asks for a single total.
+- Reply as JSON in this exact format: {{"sql": "your query here"}}
+ 
+{SCHEMA}
+"""
+ 
+
+
+@st.cache_resource
+def get_connection():
+    return snowflake.connector.connect(
+        account=os.getenv("SNOWFLAKE_ACCOUNT"),
+        user=os.getenv("SNOWFLAKE_USER"),
+        password=os.getenv("SNOWFLAKE_PASSWORD"),
+        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
+        database=os.getenv("SNOWFLAKE_DATABASE"),
+        schema="MARTS",
+        role="DBT_ROLE",
+    )
+
+
+def generate_sql(question):
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": question,
+            },
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+
+    answer = response.choices[0].message.content
+    result = json.loads(answer)
+
+    sql = result["sql"]
+
+    sql = (
+        sql.replace("ZOMATO.MARTS.", "")
+           .replace("ZOMATO.", "")
+    )
+
+    return sql.strip().rstrip(";")
+
+
+def is_safe(sql):
+    lowered = sql.lower()
+
+    if not lowered.startswith("select") and not lowered.startswith("with"):
+        return False
+
+    for word in FORBIDDEN_WORDS:
+        if word in lowered:
+            return False
+
+    return True
+
+def run_query(sql):
     conn = get_connection()
-    query = f"""
-        SELECT REVIEW_ID, CITY, RATING, COMMENT
-        FROM ZOMATO.STAGING.STG_REVIEWS
-        SAMPLE ({NEW_REVIEWS} ROWS)
-    """
-    df = conn.cursor().execute(query).fetch_pandas_all()
-    conn.close()
+    cursor = conn.cursor()
+    return cursor.execute(sql).fetch_pandas_all()
 
-    df.columns = [col.lower() for col in df.columns]
-    return df
 
-def _embed_one(text, retries=3):
-    """Call the HF feature-extraction endpoint for a single string, with retries
-    for the transient errors that are common on the free serverless tier
-    (503 = model is still loading, 429 = rate limited)."""
-    last_err = None
-    for attempt in range(retries):
-        try:
-            result = hf_client.feature_extraction(text, model=EMBED_MODEL)
-            return np.asarray(result, dtype=np.float32).reshape(-1)
-        except HfHubHTTPError as e:
-            last_err = e
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Hugging Face embedding failed after {retries} attempts: {last_err}")
+st.title("Chat with your Zomato Data")
+st.caption(f"Ask in English, {MODEL} writes the SQL, Snowflake runs it")
 
-def embed(texts, show_progress=False):
-    """Embed one or more strings. Always returns a 2D numpy array of shape
-    (len(texts), embedding_dim), even for a single input."""
-    if isinstance(texts, str):
-        texts = [texts]
+with st.sidebar:
+    st.header("Example Questions")
+    for q in EXAMPLE_QUESTIONS:
+        st.markdown(f" - {q}")
 
-    progress = st.progress(0.0) if show_progress else None
-    vectors = []
-    for i, text in enumerate(texts):
-        vectors.append(_embed_one(text))
-        if progress is not None:
-            progress.progress((i + 1) / len(texts))
-    if progress is not None:
-        progress.empty()
+question = st.text_input("Enter your question here", 
+                         placeholder="e.g. Top 10 restaurants by revenune in Banglore")
 
-    return np.vstack(vectors)
-
-@st.cache_data()
-def load_reviews():
-    if os.path.exists(CACHE_FILE):
-        return pd.read_parquet(CACHE_FILE)
-
-    df = read_reviews_from_snowflake()
-    with st.spinner(f"Embedding {len(df)} reviews (first run only)..."):
-        df["embedding"] = list(embed(df["comment"].tolist(), show_progress=True))
-    df.to_parquet(CACHE_FILE)
-    return df
-
-st.title("Chat with your Zomato Reviews")
-st.caption(f"Searching {NEW_REVIEWS} reviews, answering with {CHAT_MODEL} (via Groq)")
-
-def cosine_similarity(vec_a, vec_b):
-    return np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
-
-def find_similar_reviews(question, df):
-    question_vector = embed(question)[0]
-
-    scores = []
-    for review_vector in df["embedding"]:
-        scores.append(cosine_similarity(question_vector, review_vector))
-
-    df = df.copy()
-    df["score"] = scores
-    return df.nlargest(TOK_K, "score")
-
-def ask_llm(question, top_reviews):
-    context = ""
-    for _, row in top_reviews.iterrows():
-        context += f" ({row['city']}, {row['rating']} stars) {row['comment']}\n"
-
-    system_prompt = (
-        "Answer ONLY using the customer reviews provided. "
-        "Be concise. If the reviews don't cover it, say so."
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Question: {question}\n\nReviews:\n{context}"}
-    ]
-
-    response = groq_client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages
-    )
-    return response.choices[0].message.content
-
-review_df = load_reviews()
-
-question = st.text_input(
-    "Ask a question about your reviews:",
-    placeholder="e.g. What are the most common complaints about delivery?"
-)
 
 if question:
-    top_reviews = find_similar_reviews(question, review_df)
-    answer = ask_llm(question, top_reviews)
+    sql = generate_sql(question)
+    st.code(sql, language="sql")
 
-    st.markdown("**Answer:**")
-    st.write(answer)
+    if not is_safe(sql):
+        st.error("The generated SQL is not safe to run. Please modify your question.")
 
-    with st.expander("Reviews used to build this answer"):
-        st.dataframe(top_reviews[["city", "rating", "comment"]], hide_index=True)
+    else:
+        try:
+            df = run_query(sql)
+            st.success(f"{len(df)} rows returned")
+            st.dataframe(df, hide_index=True)
+
+            if len(df.columns) == 2 and pd.api.types.is_numeric_dtype(df.iloc[:, 1]):
+                st.bar_chart(df, x=df.columns[0], y=df.columns[1])
+
+        except Exception as e:
+            st.error(f"Error running query: {e}")
