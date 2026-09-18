@@ -29,7 +29,7 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 hf_client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
 
-CHAT_MODEL = "llama-3.1-8b-instant"  # Fast, free Groq model (Llama 3.1 8B)
+CHAT_MODEL = "openai/gpt-oss-20b"  # Groq deprecated llama-3.1-8b-instant on 08/16/26; this is their recommended replacement
 NEW_REVIEWS = 500
 TOK_K = 5
 CACHE_FILE = "review_embeddings.parquet"
