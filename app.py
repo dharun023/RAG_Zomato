@@ -1,10 +1,12 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 import streamlit as st
 import snowflake.connector
-import requests
 from groq import Groq
+from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,12 +21,15 @@ if not HF_TOKEN:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Hugging Face API setup for embeddings
-HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
-HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+# --- Hugging Face embeddings -------------------------------------------------
+# NOTE: the old "https://api-inference.huggingface.co/..." REST endpoint has been
+# fully retired by Hugging Face (it no longer even resolves in DNS). Embeddings
+# now go through the Inference Providers router, which this client handles for us
+# so we don't have to hardcode a URL that can change again.
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+hf_client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
 
-# CHAT_MODEL = "llama-3.1-8b-instant"  # Fast, free Groq model (Llama 3.1 8B)
-CHAT_MODEL = "llama-3.1-8b-instant"
+CHAT_MODEL = "llama-3.1-8b-instant"  # Fast, free Groq model (Llama 3.1 8B)
 NEW_REVIEWS = 500
 TOK_K = 5
 CACHE_FILE = "review_embeddings.parquet"
@@ -52,17 +57,36 @@ def read_reviews_from_snowflake():
     df.columns = [col.lower() for col in df.columns]
     return df
 
-def embed(texts):
+def _embed_one(text, retries=3):
+    """Call the HF feature-extraction endpoint for a single string, with retries
+    for the transient errors that are common on the free serverless tier
+    (503 = model is still loading, 429 = rate limited)."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            result = hf_client.feature_extraction(text, model=EMBED_MODEL)
+            return np.asarray(result, dtype=np.float32).reshape(-1)
+        except HfHubHTTPError as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Hugging Face embedding failed after {retries} attempts: {last_err}")
+
+def embed(texts, show_progress=False):
+    """Embed one or more strings. Always returns a 2D numpy array of shape
+    (len(texts), embedding_dim), even for a single input."""
     if isinstance(texts, str):
         texts = [texts]
-    
-    # Generate embeddings via Hugging Face API instead of local PyTorch
-    response = requests.post(HF_API_URL, headers=HF_HEADERS, json={"inputs": texts})
-    
-    if response.status_code != 200:
-        raise RuntimeError(f"Hugging Face API error ({response.status_code}): {response.text}")
-        
-    return response.json()
+
+    progress = st.progress(0.0) if show_progress else None
+    vectors = []
+    for i, text in enumerate(texts):
+        vectors.append(_embed_one(text))
+        if progress is not None:
+            progress.progress((i + 1) / len(texts))
+    if progress is not None:
+        progress.empty()
+
+    return np.vstack(vectors)
 
 @st.cache_data()
 def load_reviews():
@@ -70,7 +94,8 @@ def load_reviews():
         return pd.read_parquet(CACHE_FILE)
 
     df = read_reviews_from_snowflake()
-    df["embedding"] = embed(df["comment"].tolist())
+    with st.spinner(f"Embedding {len(df)} reviews (first run only)..."):
+        df["embedding"] = list(embed(df["comment"].tolist(), show_progress=True))
     df.to_parquet(CACHE_FILE)
     return df
 
@@ -81,7 +106,7 @@ def cosine_similarity(vec_a, vec_b):
     return np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
 
 def find_similar_reviews(question, df):
-    question_vector = embed([question])[0]
+    question_vector = embed(question)[0]
 
     scores = []
     for review_vector in df["embedding"]:
