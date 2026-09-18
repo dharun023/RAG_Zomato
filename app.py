@@ -10,8 +10,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
-
 
 MODEL = "openai/gpt-oss-20b"  # Groq deprecated llama-3.1-8b-instant on 08/16/26; this is their recommended replacement
 
