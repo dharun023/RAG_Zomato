@@ -3,33 +3,31 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import snowflake.connector
+import requests
 from groq import Groq
-from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is missing. Please set it in your .env file or Render dashboard.")
+if not HF_TOKEN:
+    raise RuntimeError("HF_TOKEN is missing. Please set it in your .env file or Render dashboard.")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Initialize the local embedding model
-@st.cache_resource()
-def get_embedding_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-embedding_model = get_embedding_model()
+# Hugging Face API setup for embeddings
+HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
 # CHAT_MODEL = "llama-3.1-8b-instant"  # Fast, free Groq model (Llama 3.1 8B)
-CHAT_MODEL = "openai/gpt-oss-120b"
+CHAT_MODEL = "llama-3.1-8b-instant"
 NEW_REVIEWS = 500
 TOK_K = 5
 CACHE_FILE = "review_embeddings.parquet"
-
-
 
 def read_reviews_from_snowflake():
     def get_connection():
@@ -58,9 +56,13 @@ def embed(texts):
     if isinstance(texts, str):
         texts = [texts]
     
-    # Generate embeddings locally using sentence-transformers
-    embeddings = embedding_model.encode(texts)
-    return embeddings.tolist()
+    # Generate embeddings via Hugging Face API instead of local PyTorch
+    response = requests.post(HF_API_URL, headers=HF_HEADERS, json={"inputs": texts})
+    
+    if response.status_code != 200:
+        raise RuntimeError(f"Hugging Face API error ({response.status_code}): {response.text}")
+        
+    return response.json()
 
 @st.cache_data()
 def load_reviews():

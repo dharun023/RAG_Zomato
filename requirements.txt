@@ -3,7 +3,7 @@ pandas
 snowflake-connector-python[pandas]
 groq
 python-dotenv
-sentence-transformers
+requests
 plotly
 sqlparse
 numpy
